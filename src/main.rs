@@ -7,7 +7,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context as _, ensure};
+use anyhow::{Context as _, bail, ensure};
+use clap::{Parser, Subcommand};
 use russh::{
     ChannelMsg,
     client::{self, Handle, Handler},
@@ -26,81 +27,103 @@ struct Site {
     target: String,
 }
 
-#[derive(Deserialize)]
-struct Config {
-    #[serde(rename = "site")]
-    sites: Vec<Site>,
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// List all configured sites
+    List,
+    /// Build and publish sites
+    Deploy {
+        /// Site names
+        #[arg(required = true, group = "site")]
+        sites: Vec<String>,
+        /// Deploy all configured sites
+        #[arg(short, long, group = "site")]
+        all: bool,
+    },
 }
 
 #[main]
 async fn main() {
-    let user = env::var("USER").expect("failed to get the current user from `$USER`");
-    let home_dir = env::home_dir().expect("failed to get the home directory path");
-
-    let ssh_configs = parse_ssh_config(
-        &fs::read_to_string(home_dir.join(".ssh/config"))
-            .expect("failed to read the SSH config file"),
+    let cli = Cli::parse();
+    let sites = toml::from_str::<HashMap<String, Site>>(
+        &fs::read_to_string("config.toml").expect("failed to read the config file"),
     )
-    .expect("failed to parse the SSH config");
+    .expect("failed to parse the config");
 
-    let Config { sites } =
-        toml::from_str(&fs::read_to_string("config.toml").expect("failed to read the config file"))
-            .expect("failed to parse the config");
+    match cli.command {
+        Commands::List => println!("{}", sites.keys().cloned().collect::<Vec<_>>().join(" ")),
+        Commands::Deploy { sites: names, all } => {
+            deploy(&sites, (!all).then_some(&names)).await.unwrap();
+        }
+    }
+}
+
+async fn deploy(sites: &HashMap<String, Site>, names: Option<&Vec<String>>) -> anyhow::Result<()> {
+    let user = env::var("USER")?;
+    let home_dir = env::home_dir().context("failed to get the home directory path")?;
+
+    let ssh_configs = parse_ssh_config(&fs::read_to_string(home_dir.join(".ssh/config"))?)?;
+
+    let sites: Vec<_> = if let Some(names) = names {
+        sites
+            .iter()
+            .filter(|(name, _)| names.contains(name))
+            .map(|(_, site)| site)
+            .collect()
+    } else {
+        sites.values().collect()
+    };
     for site in sites {
         let output = Command::new("bash")
             .arg("-c")
             .arg(&site.build_command)
             .current_dir(&site.working_dir)
-            .output()
-            .expect("fail to spawn the build command");
-        if !output.status.success() {
-            eprintln!(
-                "`{}`:`{}` error {}:\n=== stdout ===\n{}\n=== stderr ===\n{}",
-                site.working_dir,
-                site.build_command,
-                output.status,
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim(),
-            );
-            break;
-        }
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "`{}`:`{}` error {}:\n=== stdout ===\n{}\n=== stderr ===\n{}",
+            site.working_dir,
+            site.build_command,
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
 
-        let (host, path) = site
-            .target
-            .split_once(':')
-            .unwrap_or_else(|| panic!("bad target syntax: {}", site.target));
+        let Some((host, path)) = site.target.split_once(':') else {
+            bail!("bad target syntax: {}", site.target)
+        };
 
         let session = SSHSession::connect(
             ssh_configs
                 .get(host)
-                .unwrap_or_else(|| panic!("failed to find the host `{host}` in SSH config")),
+                .context("failed to find the host in SSH config")?,
             &user,
         )
-        .await
-        .unwrap_or_else(|e| panic!("SSH: failed to connect the host `{host}`: {e:?}"));
+        .await?;
 
         let path = Path::new(path);
-        let parent = path.parent().unwrap();
-        let name = path.file_name().unwrap().to_str().unwrap();
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let parent = path.parent().context("invalid path")?;
+        let name = path
+            .file_name()
+            .context("invalid path")?
+            .to_str()
+            .context("invalid path")?;
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let name_ts = format!("{name}_{ts}");
         let archive = format!("{name_ts}.tar.zst");
 
         session
             .copy(
                 parent.join(&archive),
-                &compress(&site.build_output, &name_ts).unwrap_or_else(|e| {
-                    panic!(
-                        "failed to compress the directory `{}: {e:?}`",
-                        site.build_output
-                    )
-                }),
+                &compress(&site.build_output, &name_ts)?,
             )
-            .await
-            .expect("failed to copy file via SSH");
+            .await?;
         session
             .execute(&format!(
                 r#"bash -c '
@@ -121,11 +144,12 @@ tar -xf {archive}
 ln -s {name_ts} {name}_t
 mv -fT {name}_t {name}
 '"#,
-                parent.to_str().unwrap()
+                parent.to_str().context("invalid path")?
             ))
-            .await
-            .expect("failed to execute remote command")
+            .await?
     }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

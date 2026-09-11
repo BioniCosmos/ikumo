@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 russh = "0.63"
 russh-sftp = "3"
 serde = { version = "1", features = ["derive"] }
