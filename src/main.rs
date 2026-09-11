@@ -6,8 +6,9 @@ use russh::{
     client::{self, Handle, Handler},
     keys::{PublicKeyOrCertificate, agent::client::AgentClient},
 };
+use russh_sftp::client::SftpSession;
 use serde::Deserialize;
-use tokio::main;
+use tokio::{io::AsyncWriteExt as _, main};
 
 #[derive(Debug, Deserialize)]
 #[allow(unused)]
@@ -221,6 +222,18 @@ impl SSHSession {
             stdout.trim(),
             stderr.trim(),
         );
+        Ok(())
+    }
+
+    async fn copy(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
+        let ch = self.session.channel_open_session().await?;
+        ch.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(ch.into_stream()).await?;
+
+        let mut file = sftp.create(path).await?;
+        file.write_all(data).await?;
+        file.close().await?;
+
         Ok(())
     }
 }
