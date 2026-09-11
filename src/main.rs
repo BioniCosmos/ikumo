@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, fs, process::Command, sync::Arc};
+use std::{collections::HashMap, env, fs, path::Path, process::Command, sync::Arc};
 
 use anyhow::ensure;
 use russh::{
@@ -8,6 +8,7 @@ use russh::{
 };
 use russh_sftp::client::SftpSession;
 use serde::Deserialize;
+use tar::{Builder, HeaderMode};
 use tokio::{io::AsyncWriteExt as _, main};
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +250,14 @@ impl Handler for SSHHandler {
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
+}
+
+fn compress<P: AsRef<Path>>(path: P, dir_name: &str) -> anyhow::Result<Vec<u8>> {
+    let mut archive = Builder::new(vec![]);
+    archive.mode(HeaderMode::Deterministic);
+    archive.follow_symlinks(false);
+    archive.append_dir_all(dir_name, &path)?;
+    zstd::encode_all(archive.into_inner()?.as_slice(), 0).map_err(anyhow::Error::new)
 }
 
 #[cfg(test)]
