@@ -1,6 +1,6 @@
 # ikumo
 
-Build and deploy the site to your server via SSH.
+Build and deploy sites to your servers via SSH.
 
 ```console
 $ ikumo -h
