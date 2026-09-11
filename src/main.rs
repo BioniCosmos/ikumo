@@ -1,6 +1,13 @@
-use std::{collections::HashMap, env, fs, path::Path, process::Command, sync::Arc};
+use std::{
+    collections::HashMap,
+    env, fs,
+    path::Path,
+    process::Command,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::ensure;
+use anyhow::{Context as _, ensure};
 use russh::{
     ChannelMsg,
     client::{self, Handle, Handler},
@@ -59,6 +66,67 @@ async fn main() {
             );
             break;
         }
+
+        let (host, path) = site
+            .target
+            .split_once(':')
+            .unwrap_or_else(|| panic!("bad target syntax: {}", site.target));
+
+        let session = SSHSession::connect(
+            ssh_configs
+                .get(host)
+                .unwrap_or_else(|| panic!("failed to find the host `{host}` in SSH config")),
+            &user,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSH: failed to connect the host `{host}`: {e:?}"));
+
+        let path = Path::new(path);
+        let parent = path.parent().unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name_ts = format!("{name}_{ts}");
+        let archive = format!("{name_ts}.tar.zst");
+
+        session
+            .copy(
+                parent.join(&archive),
+                &compress(&site.build_output, &name_ts).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to compress the directory `{}: {e:?}`",
+                        site.build_output
+                    )
+                }),
+            )
+            .await
+            .expect("failed to copy file via SSH");
+        session
+            .execute(&format!(
+                r#"bash -c '
+set -e
+
+cleanup() {{
+  if [ $? -ne 0 ]; then
+    rm -rf {name_ts}
+  fi
+  if [ -f {archive} ]; then
+    rm -rf {archive}
+  fi
+}}
+trap cleanup EXIT
+
+cd {}
+tar -xf {archive}
+ln -s {name_ts} {name}_t
+mv -fT {name}_t {name}
+'"#,
+                parent.to_str().unwrap()
+            ))
+            .await
+            .expect("failed to execute remote command")
     }
 }
 
@@ -206,7 +274,7 @@ impl SSHSession {
                 None => break,
                 Some(msg) => match msg {
                     ChannelMsg::Data { data } => stdout = String::from_utf8(data.to_vec())?,
-                    ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
+                    ChannelMsg::ExtendedData { data, ext: 1 } => {
                         stderr = String::from_utf8(data.to_vec())?
                     }
                     ChannelMsg::ExitStatus { exit_status } => status = exit_status,
@@ -226,12 +294,14 @@ impl SSHSession {
         Ok(())
     }
 
-    async fn copy(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
+    async fn copy<P: AsRef<Path>>(&self, path: P, data: &[u8]) -> anyhow::Result<()> {
         let ch = self.session.channel_open_session().await?;
         ch.request_subsystem(true, "sftp").await?;
         let sftp = SftpSession::new(ch.into_stream()).await?;
 
-        let mut file = sftp.create(path).await?;
+        let mut file = sftp
+            .create(path.as_ref().to_str().context("invalid path")?)
+            .await?;
         file.write_all(data).await?;
         file.close().await?;
 
