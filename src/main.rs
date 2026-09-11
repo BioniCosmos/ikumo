@@ -19,13 +19,11 @@ use tar::{Builder, HeaderMode};
 use tokio::{io::AsyncWriteExt as _, main};
 
 #[derive(Debug, Deserialize)]
-#[allow(unused)]
 struct Site {
     working_dir: String,
     build_command: String,
     build_output: String,
     target: String,
-    reload_command: String,
 }
 
 #[derive(Deserialize)]
