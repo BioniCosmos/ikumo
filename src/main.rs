@@ -1,6 +1,11 @@
-use std::{collections::HashMap, fs, process::Command};
+use std::{collections::HashMap, env, fs, process::Command, sync::Arc};
 
-use anyhow::bail;
+use anyhow::ensure;
+use russh::{
+    ChannelMsg,
+    client::{self, Handle, Handler},
+    keys::{PublicKeyOrCertificate, agent::client::AgentClient},
+};
 use serde::Deserialize;
 use tokio::main;
 
@@ -22,6 +27,15 @@ struct Config {
 
 #[main]
 async fn main() {
+    let user = env::var("USER").expect("failed to get the current user from `$USER`");
+    let home_dir = env::home_dir().expect("failed to get the home directory path");
+
+    let ssh_configs = parse_ssh_config(
+        &fs::read_to_string(home_dir.join(".ssh/config"))
+            .expect("failed to read the SSH config file"),
+    )
+    .expect("failed to parse the SSH config");
+
     let Config { sites } =
         toml::from_str(&fs::read_to_string("config.toml").expect("failed to read the config file"))
             .expect("failed to parse the config");
@@ -34,7 +48,7 @@ async fn main() {
             .expect("fail to spawn the build command");
         if !output.status.success() {
             eprintln!(
-                "`{}`:`{}` error {}:\n\n===stdout===\n{}\n===stderr===\n{}",
+                "`{}`:`{}` error {}:\n=== stdout ===\n{}\n=== stderr ===\n{}",
                 site.working_dir,
                 site.build_command,
                 output.status,
@@ -97,9 +111,7 @@ fn parse_ssh_config(raw: &str) -> anyhow::Result<HashMap<String, SSHConfig>> {
             ' ' | '\t' | '\n' => i += 1,
             'H' => {
                 if i + 8 <= raw.len() && &raw[i..i + 8] == b"HostName" {
-                    if host.is_empty() {
-                        bail!("missing `Host`");
-                    }
+                    ensure!(!host.is_empty(), "missing `Host`");
                     config.host_name = String::from_utf8(read_value!(i + 8).to_vec())?;
                 } else if i + 4 <= raw.len() && &raw[i..i + 4] == b"Host" {
                     if !host.is_empty() {
@@ -113,9 +125,7 @@ fn parse_ssh_config(raw: &str) -> anyhow::Result<HashMap<String, SSHConfig>> {
             }
             'P' => {
                 if i + 4 <= raw.len() && &raw[i..i + 4] == b"Port" {
-                    if host.is_empty() {
-                        bail!("missing `Host`");
-                    }
+                    ensure!(!host.is_empty(), "missing `Host`");
                     config.port = str::from_utf8(read_value!(i + 4))?.parse()?;
                 } else {
                     consume_line!();
@@ -123,9 +133,7 @@ fn parse_ssh_config(raw: &str) -> anyhow::Result<HashMap<String, SSHConfig>> {
             }
             'U' => {
                 if i + 4 <= raw.len() && &raw[i..i + 4] == b"User" {
-                    if host.is_empty() {
-                        bail!("missing `Host`");
-                    }
+                    ensure!(!host.is_empty(), "missing `Host`");
                     config.user = String::from_utf8(read_value!(i + 4).to_vec())?;
                 } else {
                     consume_line!();
@@ -140,6 +148,94 @@ fn parse_ssh_config(raw: &str) -> anyhow::Result<HashMap<String, SSHConfig>> {
     }
 
     Ok(m)
+}
+
+struct SSHSession {
+    session: Handle<SSHHandler>,
+}
+
+impl SSHSession {
+    async fn connect(config: &SSHConfig, default_user: &str) -> anyhow::Result<Self> {
+        let mut session = client::connect(
+            Arc::new(client::Config::default()),
+            (
+                config.host_name.as_str(),
+                if config.port == 0 { 22 } else { config.port },
+            ),
+            SSHHandler,
+        )
+        .await?;
+        let mut agent = AgentClient::connect_env().await?;
+
+        let mut auth_success = false;
+        for id in agent.request_identities().await? {
+            if session
+                .authenticate_publickey_with(
+                    if config.user.is_empty() {
+                        default_user
+                    } else {
+                        &config.user
+                    },
+                    id.public_key().into_owned(),
+                    None,
+                    &mut agent,
+                )
+                .await?
+                .success()
+            {
+                auth_success = true;
+                break;
+            }
+        }
+
+        ensure!(auth_success, "SSH authentication failed.");
+        Ok(Self { session })
+    }
+
+    async fn execute(&self, command: &str) -> anyhow::Result<()> {
+        let mut ch = self.session.channel_open_session().await?;
+        ch.exec(true, command).await?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut status = 0;
+        loop {
+            match ch.wait().await {
+                None => break,
+                Some(msg) => match msg {
+                    ChannelMsg::Data { data } => stdout = String::from_utf8(data.to_vec())?,
+                    ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
+                        stderr = String::from_utf8(data.to_vec())?
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => status = exit_status,
+                    _ => (),
+                },
+            }
+        }
+
+        anyhow::ensure!(
+            status == 0,
+            "SSH executed command `{}` with status {}:\n=== stdout ===\n{}\n=== stderr ===\n{}",
+            command,
+            status,
+            stdout.trim(),
+            stderr.trim(),
+        );
+        Ok(())
+    }
+}
+
+struct SSHHandler;
+
+impl Handler for SSHHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
